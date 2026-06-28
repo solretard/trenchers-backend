@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")          # use the SERVICE ROLE key (server-only!)
 SEASON = os.environ.get("TRENCHERS_SEASON", "0")
+TABLE = os.environ.get("TRENCHERS_TABLE", "trenchers_runs")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
@@ -151,9 +152,9 @@ def submit_run(run: RunIn):
     }
 
     if USE_SUPABASE:
-        sb.table("runs").insert(record).execute()
+        sb.table(TABLE).insert(record).execute()
         higher = (
-            sb.table("runs")
+            sb.table(TABLE)
             .select("id", count="exact")
             .eq("season", SEASON)
             .gt("scars", run.scars)
@@ -161,7 +162,7 @@ def submit_run(run: RunIn):
         )
         rank = (higher.count or 0) + 1
         best_res = (
-            sb.table("runs")
+            sb.table(TABLE)
             .select("scars")
             .eq("season", SEASON)
             .eq("handle", handle)
@@ -190,7 +191,7 @@ def leaderboard(limit: int = 20, faction: Optional[str] = None):
     limit = max(1, min(limit, 100))
 
     if USE_SUPABASE:
-        q = sb.table("runs").select("handle,faction,scars,depth").eq("season", SEASON)
+        q = sb.table(TABLE).select("handle,faction,scars,depth").eq("season", SEASON)
         if faction:
             q = q.eq("faction", faction.upper())
         # Over-fetch so we can keep only each player's best run after dedupe.
@@ -221,7 +222,7 @@ def factions():
     faction's total, so it rewards a faction's spread of strong players rather
     than letting one grinder submit a thousand runs."""
     if USE_SUPABASE:
-        rows = sb.table("runs").select("handle,faction,scars").eq("season", SEASON).execute().data
+        rows = sb.table(TABLE).select("handle,faction,scars").eq("season", SEASON).execute().data
     else:
         rows = [r for r in _mem_runs if r["season"] == SEASON]
 
