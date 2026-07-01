@@ -12,9 +12,11 @@ Anti-cheat: validate_run() is a deliberate placeholder — harden before real re
 
 import os
 import time
+import secrets
+from collections import defaultdict
 from typing import Optional, List, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -40,6 +42,46 @@ _mem_runs: List[Dict] = []
 FACTIONS = {"APER", "DIAMOND", "SNIPER"}
 
 # --------------------------------------------------------------------------- #
+# Anti-cheat tunables (raise the cost of faking; not bulletproof by design)
+# --------------------------------------------------------------------------- #
+MAX_SCARS_PER_SEC = 500        # a run can't earn more scars/sec than this
+MIN_SEC_PER_DEPTH = 3.0        # each room takes at least this long to clear
+MIN_SESSION_SEC = 8.0          # a real run lasts at least this long
+SESSION_TTL_SEC = 3 * 3600     # a session token is submittable for this long
+SESSION_START_COOLDOWN = 6.0   # min seconds between a subject's session starts
+MAX_SUBMITS_PER_HOUR = 40      # per subject (wallet/handle) and per IP
+
+# Ephemeral server-side sessions: {sid: {"sub": str, "iat": float, "ip": str, "used": bool}}
+_sessions: Dict[str, Dict] = {}
+_last_start: Dict[str, float] = {}                 # subject -> last session-start time
+_submit_log: Dict[str, List[float]] = defaultdict(list)   # key -> recent submit timestamps
+
+
+def _client_ip(req: Request) -> str:
+    fwd = req.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return req.client.host if req.client else "unknown"
+
+
+def _rate_ok(key: str) -> bool:
+    now = time.time()
+    log = [t for t in _submit_log[key] if now - t < 3600]
+    _submit_log[key] = log
+    return len(log) < MAX_SUBMITS_PER_HOUR
+
+
+def _rate_hit(key: str):
+    _submit_log[key].append(time.time())
+
+
+def _prune_sessions():
+    now = time.time()
+    dead = [s for s, v in _sessions.items() if now - v["iat"] > SESSION_TTL_SEC]
+    for s in dead:
+        _sessions.pop(s, None)
+
+# --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class RunIn(BaseModel):
@@ -48,10 +90,20 @@ class RunIn(BaseModel):
     scars: int = Field(ge=0, le=10_000_000)
     depth: int = Field(ge=1, le=100_000)
     kills: int = Field(ge=0, le=10_000_000)
+    session: str = Field(min_length=8, max_length=64)   # required — issued by /session/start
     # Future identity / anti-cheat — accepted but not yet enforced.
     wallet: Optional[str] = None
     signature: Optional[str] = None
-    run_token: Optional[str] = None
+
+
+class SessionIn(BaseModel):
+    handle: Optional[str] = Field(default=None, max_length=24)
+    wallet: Optional[str] = None
+
+
+class SessionOut(BaseModel):
+    session: str
+    issued_at: int
 
 
 class RunOut(BaseModel):
@@ -98,15 +150,20 @@ def verify_wallet(wallet: Optional[str], signature: Optional[str]) -> bool:
 
 
 def validate_run(run: RunIn) -> bool:
-    """TODO: real server-authoritative anti-cheat.
-    For now: faction must be valid and the score must be vaguely plausible
-    given depth + kills, to reject obviously-faked submissions."""
+    """Structural plausibility: faction valid and score not exceeding what
+    depth + kills could yield. The *timing* gate (in submit_run) is the real
+    teeth — this just rejects obviously-inconsistent numbers."""
     if run.faction not in FACTIONS:
         return False
     ceiling = 60 * run.depth + 35 * run.kills + 500
     if run.scars > ceiling:
         return False
     return True
+
+
+def min_seconds_for(scars: int, depth: int) -> float:
+    """Least wall-clock time a legit run of this size could take."""
+    return max(MIN_SESSION_SEC, scars / MAX_SCARS_PER_SEC, depth * MIN_SEC_PER_DEPTH)
 
 
 def sanitize_handle(h: str) -> str:
@@ -131,13 +188,63 @@ def health():
     }
 
 
+@app.post("/session/start", response_model=SessionOut)
+def session_start(body: SessionIn, request: Request):
+    _prune_sessions()
+    ip = _client_ip(request)
+    sub = (body.wallet or sanitize_handle(body.handle or "") or ip)
+    now = time.time()
+
+    # simple per-subject cooldown so you can't spin up sessions in a tight loop
+    last = _last_start.get(sub, 0.0)
+    if now - last < SESSION_START_COOLDOWN:
+        raise HTTPException(status_code=429, detail="slow down")
+    if not _rate_ok("ip:" + ip):
+        raise HTTPException(status_code=429, detail="too many sessions from this network")
+    _last_start[sub] = now
+
+    sid = secrets.token_urlsafe(24)
+    _sessions[sid] = {"sub": sub, "iat": now, "ip": ip, "used": False}
+    return SessionOut(session=sid, issued_at=int(now))
+
+
 @app.post("/runs", response_model=RunOut)
-def submit_run(run: RunIn):
+def submit_run(run: RunIn, request: Request):
     run.faction = run.faction.upper()
+    ip = _client_ip(request)
+
+    # 1) must present a live, unused session token
+    sess = _sessions.get(run.session)
+    if not sess:
+        raise HTTPException(status_code=401, detail="no active session — start a run first")
+    if sess["used"]:
+        raise HTTPException(status_code=409, detail="session already submitted")
+    now = time.time()
+    elapsed = now - sess["iat"]
+    if elapsed > SESSION_TTL_SEC:
+        _sessions.pop(run.session, None)
+        raise HTTPException(status_code=410, detail="session expired")
+
+    # 2) structural plausibility
     if not validate_run(run):
         raise HTTPException(status_code=400, detail="run failed validation")
+
+    # 3) timing gate — the score can't have been earned faster than physically possible
+    if elapsed + 1.0 < min_seconds_for(run.scars, run.depth):
+        raise HTTPException(status_code=400, detail="run too fast to be real")
+
+    # 4) rate limits (per subject and per network)
+    sub = sess["sub"]
+    if not _rate_ok("sub:" + sub) or not _rate_ok("ip:" + ip):
+        raise HTTPException(status_code=429, detail="rate limit — try again later")
+
     if run.wallet and not verify_wallet(run.wallet, run.signature):
         raise HTTPException(status_code=401, detail="bad wallet signature")
+
+    # consume the session and count against the rate windows
+    sess["used"] = True
+    _rate_hit("sub:" + sub)
+    _rate_hit("ip:" + ip)
 
     handle = sanitize_handle(run.handle)
     record = {
