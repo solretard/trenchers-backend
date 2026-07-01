@@ -11,11 +11,13 @@ Anti-cheat: validate_run() is a deliberate placeholder — harden before real re
 """
 
 import os
+import re
 import time
 import secrets
 from collections import defaultdict
 from typing import Optional, List, Dict
 
+import httpx                      # outbound calls to the Xaman platform
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -27,7 +29,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")          # use the SERVICE ROLE key (server-only!)
 SEASON = os.environ.get("TRENCHERS_SEASON", "0")
 TABLE = os.environ.get("TRENCHERS_TABLE", "trenchers_runs")
+PLAYERS_TABLE = os.environ.get("TRENCHERS_PLAYERS_TABLE", "trenchers_players")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+
+# Xaman (XUMM) — sign-in via the user's Xaman app. Secret stays server-side.
+XAMAN_API_KEY = os.environ.get("XAMAN_API_KEY")
+XAMAN_API_SECRET = os.environ.get("XAMAN_API_SECRET")
+XAMAN_ENABLED = bool(XAMAN_API_KEY and XAMAN_API_SECRET)
+XAMAN_BASE = "https://xumm.app/api/v1/platform"
 
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 if USE_SUPABASE:
@@ -37,6 +46,13 @@ if USE_SUPABASE:
 
 # In-memory store (used when Supabase isn't configured)
 _mem_runs: List[Dict] = []
+_mem_players: Dict[str, Dict] = {}          # wallet -> {"wallet","data","updated_at"}
+
+_WALLET_RE = re.compile(r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$")
+
+
+def valid_wallet(w: Optional[str]) -> bool:
+    return bool(w) and isinstance(w, str) and bool(_WALLET_RE.match(w))
 
 # The three playable classes double as the faction-war teams for now.
 FACTIONS = {"APER", "DIAMOND", "SNIPER"}
@@ -104,6 +120,16 @@ class SessionIn(BaseModel):
 class SessionOut(BaseModel):
     session: str
     issued_at: int
+
+
+class PlayerSaveIn(BaseModel):
+    wallet: str
+    data: Dict = Field(default_factory=dict)
+
+
+class PlayerOut(BaseModel):
+    wallet: str
+    data: Dict
 
 
 class RunOut(BaseModel):
@@ -291,6 +317,89 @@ def submit_run(run: RunIn, request: Request):
         )
 
     return RunOut(ok=True, rank=rank, best=best, season=SEASON)
+
+
+def _xaman_headers():
+    return {"X-API-Key": XAMAN_API_KEY, "X-API-Secret": XAMAN_API_SECRET,
+            "Content-Type": "application/json"}
+
+
+@app.post("/xaman/signin")
+def xaman_signin():
+    """Create a Xaman SignIn request. Returns a QR image URL + deeplink the
+    client shows; the user approves in their Xaman app (no payment, no keys)."""
+    if not XAMAN_ENABLED:
+        raise HTTPException(status_code=503, detail="Xaman not configured")
+    try:
+        with httpx.Client(timeout=15) as client:
+            r = client.post(XAMAN_BASE + "/payload", headers=_xaman_headers(),
+                            json={"txjson": {"TransactionType": "SignIn"}})
+        r.raise_for_status()
+        d = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Xaman request failed")
+    return {
+        "uuid": d.get("uuid"),
+        "next": (d.get("next") or {}).get("always"),
+        "qr": (d.get("refs") or {}).get("qr_png"),
+    }
+
+
+@app.get("/xaman/status/{uuid}")
+def xaman_status(uuid: str):
+    if not XAMAN_ENABLED:
+        raise HTTPException(status_code=503, detail="Xaman not configured")
+    try:
+        with httpx.Client(timeout=15) as client:
+            r = client.get(XAMAN_BASE + "/payload/" + uuid, headers=_xaman_headers())
+        r.raise_for_status()
+        d = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Xaman status failed")
+    meta = d.get("meta") or {}
+    resp = d.get("response") or {}
+    return {
+        "resolved": bool(meta.get("resolved")),
+        "signed": bool(meta.get("signed")),
+        "expired": bool(meta.get("expired")),
+        "address": resp.get("account"),
+    }
+
+
+@app.post("/player/save")
+def player_save(body: PlayerSaveIn, request: Request):
+    """Save a player's data under their wallet address (their account).
+    NOTE: ownership isn't verified yet — anyone who knows a wallet address can
+    write to it. Fine for non-sensitive game progress; add a signed-nonce check
+    before storing anything that matters. Keep the blob small."""
+    if not valid_wallet(body.wallet):
+        raise HTTPException(status_code=400, detail="invalid wallet address")
+    if len(str(body.data)) > 20_000:
+        raise HTTPException(status_code=413, detail="data too large")
+    ip = _client_ip(request)
+    if not _rate_ok("save:" + ip):
+        raise HTTPException(status_code=429, detail="slow down")
+    _rate_hit("save:" + ip)
+
+    record = {"wallet": body.wallet, "data": body.data,
+              "season": SEASON, "updated_at": int(time.time())}
+    if USE_SUPABASE:
+        sb.table(PLAYERS_TABLE).upsert(record, on_conflict="wallet").execute()
+    else:
+        _mem_players[body.wallet] = record
+    return {"ok": True}
+
+
+@app.get("/player/{wallet}", response_model=PlayerOut)
+def player_get(wallet: str):
+    if not valid_wallet(wallet):
+        raise HTTPException(status_code=400, detail="invalid wallet address")
+    if USE_SUPABASE:
+        res = sb.table(PLAYERS_TABLE).select("wallet,data").eq("wallet", wallet).limit(1).execute()
+        row = res.data[0] if res.data else None
+    else:
+        row = _mem_players.get(wallet)
+    return PlayerOut(wallet=wallet, data=(row["data"] if row else {}))
 
 
 @app.get("/leaderboard", response_model=List[LeaderRow])
